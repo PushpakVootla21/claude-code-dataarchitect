@@ -458,24 +458,33 @@ SELECT COUNT(*) AS silver_row_count FROM silver.crm_sales_details;
 ## 5. `mkt_campaign_events.yaml` — `bronze.mkt_campaign_events` -> `silver.mkt_campaign_events`
 
 ### Findings
-- **Table is currently empty (0 rows).** The Kafka copy step
-  (`node kafka-stream-copy/consume_campaign_events.js`, workshop2 part 3
-  step 9) runs after this task, so there is no live data to profile.
-- Everything below is derived from the DDL (`ddl_bronze.sql`) and its
-  comments, not from data content — per instructions, no additional
-  data-pattern checks are invented here. The DDL comment explicitly states
-  the table is append-only (not truncated between runs) and that duplicates
-  from retried Kafka messages are expected and must be removed downstream by
-  `event_id` — this directly justifies the dedup transform and the
-  Duplicate Key check.
-- `event_id`, `cmp_id`, `cmp_key`, `sls_ord_num` are always populated by the
-  producer (`INSERT_SQL` in `consume_campaign_events.js` always supplies
-  them), even though the Bronze column definitions are nullable — this
-  justifies a completeness check on those four columns.
-- **Action item once data is loaded:** re-run profiling on this table
-  (value distributions for `cmp_channel`/`cmp_type`, `cmp_discount_pct`
-  range, `applied_dt`/`event_ts` sanity, actual duplicate-event volume) and
-  revisit this YAML's checks — do not treat this section as final.
+Re-profiled after the Kafka copy step (workshop2 Part 2) loaded 600 real
+events into `bronze.mkt_campaign_events`.
+- 600 rows. Zero NULLs in any column. Zero duplicate `event_id` groups (this
+  run used a fresh random consumer group with no retries, so no bronze-level
+  duplicates were produced this time - the dedup transform stays as a
+  defensive measure per the DDL comment, which documents that retried
+  messages CAN produce duplicates).
+- `cmp_channel`: exactly 3 clean values - `Social` (251), `Email` (242),
+  `InStore` (107). No blanks/nulls/casing issues.
+- `cmp_type`: exactly 2 clean values - `P` (487, percentage) and `F` (113,
+  flat).
+- `cmp_discount_pct` / `cmp_type` are consistent per campaign: `cmp_type='F'`
+  always has `cmp_discount_pct=0`; `cmp_type='P'` always has
+  `cmp_discount_pct` in `{10,15,20,25}`, one fixed value per `cmp_key`. This
+  is a real, verifiable invariant worth checking (protects the eventual Gold
+  campaign dimension from a mismatched discount/type pairing).
+- `cmp_id` / `cmp_key` / `cmp_name` form a stable 1:1:1 mapping across all
+  600 rows (5 distinct campaigns, no inconsistent naming).
+- `sls_ord_num` matches an existing `crm_sales_details.sls_ord_num` for all
+  600 rows (0 unmatched) - real, confirmed referential integrity.
+- `applied_dt` range 2023-10-02 to 2024-06-29, no future dates.
+  `event_ts` range spans the days the consumer ran, no future timestamps.
+  `applied_dt <= CAST(event_ts AS DATE)` holds for all 600 rows.
+- No dirty values were found (no whitespace, no bad casing, no out-of-range
+  discounts) - the Kafka producer emits clean data, so `load_sql` is a
+  straight dedup/passthrough with no scrubbing transformation needed beyond
+  what was already planned.
 
 ### transform_sql
 ```sql
@@ -544,9 +553,19 @@ SELECT COUNT(*) AS silver_row_count FROM silver.mkt_campaign_events;
 2. **Critical fields populated** — `critical_fields_not_null`
    sql: `SELECT COUNT(*) FROM silver.mkt_campaign_events WHERE cmp_id IS NULL OR cmp_key IS NULL OR sls_ord_num IS NULL`
    expected: `"0"`
-
-No further additional checks are added — the table has no data yet to
-justify more than what the schema/DDL comments already evidence.
+3. **Channel domain** — `cmp_channel_domain`
+   (real data: exactly `Social`/`Email`/`InStore` observed, no other values)
+   sql: `SELECT COUNT(*) FROM silver.mkt_campaign_events WHERE cmp_channel NOT IN ('Social','Email','InStore')`
+   expected: `"0"`
+4. **Discount/type consistency** — `discount_pct_type_consistency`
+   (real invariant found: flat campaigns always carry 0%, percentage
+   campaigns always carry a value between 1 and 100)
+   sql: `SELECT COUNT(*) FROM silver.mkt_campaign_events WHERE (cmp_type = 'F' AND cmp_discount_pct <> 0) OR (cmp_type = 'P' AND (cmp_discount_pct <= 0 OR cmp_discount_pct > 100))`
+   expected: `"0"`
+5. **`sls_ord_num` resolves to a known sale** — `sls_ord_num_referential_integrity`
+   (real finding: all 600 events matched an existing sale)
+   sql: `SELECT COUNT(*) FROM silver.mkt_campaign_events m WHERE NOT EXISTS (SELECT 1 FROM silver.crm_sales_details s WHERE s.sls_ord_num = m.sls_ord_num)`
+   expected: `"0"`
 
 ### table_details.columns
 | name | source_column | type | transformation |
